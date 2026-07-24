@@ -6,6 +6,9 @@ import pandas as pd
 import numpy as np
 import re
 from airflow.operators.python import get_current_context
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Define explicit paths for Airflow's environment
 INPUT_FILE_PATH = "/tmp/signups.csv"
@@ -40,7 +43,7 @@ def signups_etl_pipeline():
             )
         
         # if it passes the check, read and return the data
-        print(f"Success: File verified at '{filepath}'")
+        logger.info(f"Success: File verified at '{filepath}'")
         return filepath
 
     @task()
@@ -102,13 +105,22 @@ def signups_etl_pipeline():
             # strip the duplicates out of the final clean dataframe
             clean_data = clean_data[~duplicate_mask]
   
-        # step 5: write to disk
+        # step 5: write out outputs
         clean_data.to_csv(CLEAN_OUTPUT_PATH, index=False)
         rejected_data.to_csv(REJECTED_OUTPUT_PATH, index=False)
 
-        print(f" Processing complete!")
-        print(f"  - Clean rows saved: {len(clean_data)} to {CLEAN_OUTPUT_PATH}")
-        print(f"  - Rejected rows saved: {len(rejected_data)} to {REJECTED_OUTPUT_PATH}")
+        logger.info(
+            "Processing complete! Saved %d clean rows to '%s'", 
+            len(clean_data),
+            CLEAN_OUTPUT_PATH,
+        )
+
+        if len(rejected_data) > 0:
+            logger.warning(
+                "%d rows rejected during data quality checks. Details written to '%s'",
+                len(rejected_data),
+                REJECTED_OUTPUT_PATH,
+            )
 
         # pass the output path downstream to load task
         return {
@@ -116,7 +128,11 @@ def signups_etl_pipeline():
             "rejected_path" : REJECTED_OUTPUT_PATH,
         }
 
-    @task()
+    @task(
+            retries=3,
+            retry_delay=timedelta(minutes=2),
+            retry_exponential_backoff=True,  # waits longer between each attempt (2m, 4m, 8m)
+    )
     def load_data(paths: dict):
         """Loads data idempotently into production using a run-specific
         staging table and an ON CONFLICT clause.
@@ -125,7 +141,7 @@ def signups_etl_pipeline():
         clean_df = pd.read_csv(clean_file, dtype=str)
 
         if clean_df.empty:
-            print("No clean records to load today.")
+            logger.warning("No clean records available to load into database today.")
             return
         
         # Fetch Airflow context to for this task to grab unique run_id
@@ -172,31 +188,38 @@ def signups_etl_pipeline():
         # Execute table setup and data merge in a single session
         with pg_hook.get_conn() as conn:
             with conn.cursor() as cursor:
-                print(f"creat exact structural clone for '{staging_table}'...")
+                logger.info("Initializing unique staging table '%s'...", staging_table)
                 cursor.execute(create_staging_sql)
                 conn.commit()
 
-        # now we write data to the clean, isolated staging table using append
-        print(f"Staging {len(clean_df)} rows into '{staging_table}'...")
-        clean_df.to_sql(
-            name=staging_table,
-            con=engine,
-            if_exists='append', # uses our pre-made schema
-            index=False,
-            method="multi",
-            chunksize=1000,
-        )
+        try:
+            # now we write data to the clean, isolated staging table using append
+            logger.info("Staging %d clean rows into '%s'...", len(clean_df), staging_table)
+            clean_df.to_sql(
+                name=staging_table,
+                con=engine,
+                if_exists='append', # uses our pre-made schema
+                index=False,
+                method="multi",
+                chunksize=1000,
+            )
 
         # perform the final sync
-        with pg_hook.get_conn() as conn:
-            with conn.cursor() as cursor:
-                print(f"Merging staging data into production table '{prod_table}'...")
-                cursor.execute(merge_sql)
-                print(f"Dropping isolated table '{staging_table}'...")
-                cursor.execute(drop_staging_sql)
-                conn.commit()
+            with pg_hook.get_conn() as conn:
+                with conn.cursor() as cursor:
+                    logger.info("Merging staging data into production table '%s'...", prod_table)
+                    cursor.execute(merge_sql)
+                    conn.commit()
 
-        print("Idempotent load complete!")
+        finally:
+                # always drop staging table (runs on success or failure of previous step)
+            with pg_hook.get_conn() as conn:
+                with conn.cursor() as cursor:
+                    logger.info("Cleaning up staging table '%s'...", staging_table)
+                    cursor.execute(drop_staging_sql)
+                    conn.commit()
+
+        logger.info("Idempotent load completed successfully.")
 
     # Setting up pipeline dependencies
     file_path = extract(INPUT_FILE_PATH)
