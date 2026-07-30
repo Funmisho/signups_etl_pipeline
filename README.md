@@ -1,43 +1,73 @@
-# PayNaija Signups ETL Pipeline
+# PayNaija Data Engineering Pipelines
 
-An Apache Airflow DAG that automates the daily process of turning a raw customer signups CSV export into clean, validated records in a Postgres reporting table — replacing what used to be a manual, error-prone spreadsheet workflow.
+A progressive Apache Airflow learning project, built one project at a time as part of a structured mentorship series. Each DAG models a realistic business problem for a fictional fintech, **PayNaija**, and is reviewed/hardened like a production system rather than a tutorial exercise.
 
-## Business context
+Currently contains two independent DAGs:
 
-PayNaija's product team exports a daily `signups.csv` from the internal admin tool. Previously, an analyst manually cleaned this file in Excel and pasted it into a reporting spreadsheet for the BI team. This pipeline automates that process end-to-end, with an emphasis on **never silently losing or corrupting data**.
+- **`signups_etl_pipeline`** — daily customer signups CSV → Postgres
+- **`exchange_rates_etl_pipeline`** — daily FX rate enrichment from a public API → Postgres
 
-## What it does
+---
 
-1. **Extract** — Verifies the incoming CSV exists and isn't empty before any processing begins.
-2. **Clean & Split** — Applies data quality rules and separates records into two outputs:
-   - `cleaned_signups.csv` — valid rows, ready to load
-   - `rejected_signups.csv` — rows with missing `signup_id`/`email` or exact duplicates, each tagged with a `rejection_reason` so nothing disappears without a trace
-3. **Load** — Loads clean rows into a `customer_signups` Postgres table using a run-scoped staging table (cloned from the production schema via `LIKE ... INCLUDING ALL`) and an `INSERT ... ON CONFLICT (signup_id) DO NOTHING` upsert, so retries and overlapping runs are safe.
+## 1. Signups ETL Pipeline (`dags/signups_etl_pipeline.py`)
 
-## Design decisions worth noting
+Automates what used to be a manual process: an analyst cleaning a daily `signups.csv` export in Excel and pasting it into a reporting spreadsheet for the BI team.
 
+**Tasks:** `extract` → `clean_and_split_data` → `load_data`
+
+- **Extract** — Verifies the incoming CSV exists and isn't empty before any processing begins.
+- **Clean & Split** — Applies data quality rules and separates records into two outputs:
+  - `cleaned_signups.csv` — valid rows, ready to load
+  - `rejected_signups.csv` — rows with missing `signup_id`/`email` or exact duplicates, each tagged with a `rejection_reason` so nothing disappears without a trace
+- **Load** — Loads clean rows into a `customer_signups` Postgres table using a run-scoped staging table (cloned from the production schema via `LIKE ... INCLUDING ALL`) and an `INSERT ... ON CONFLICT (signup_id) DO NOTHING` upsert, so retries and overlapping runs are safe.
+
+**Reliability hardening:**
+- Per-task retry tuning based on actual failure characteristics — `extract`/`clean_and_split_data` don't retry (their failures are deterministic), `load_data` retries with exponential backoff (its failures are typically transient DB/network issues).
+- Structured `logging` throughout (INFO for progress, WARNING for rejected/anomalous data) instead of `print()`.
+- A `try/finally` block guarantees the run-scoped staging table is dropped even if the load partially fails, preventing orphaned tables from piling up after exhausted retries.
+
+**Design decisions worth noting:**
 - **Modularity over convenience** — extract, clean, and load are separate tasks so each can fail, retry, and be tested independently.
 - **No dropped rows** — every row that fails validation is preserved in a rejected file with a reason, rather than vanishing.
-- **String-typed IDs everywhere** — `signup_id` is read as a string (`dtype=str`) at every point the pipeline touches a CSV, to prevent pandas from silently stripping leading zeros or misinterpreting alphanumeric IDs as integers.
-- **Idempotent loads** — a per-run staging table (named using the Airflow `run_id`) avoids collisions between concurrent or retried runs, and the schema is cloned directly from production so type mismatches are caught rather than silently coerced.
+- **String-typed IDs everywhere** — `signup_id` is read as a string (`dtype=str`) at every point the pipeline touches a CSV, preventing pandas from silently stripping leading zeros or misinterpreting alphanumeric IDs as integers.
 - **Credentials via Airflow Connections** — Postgres credentials are never hardcoded; the DAG references a `postgres_conn_id` configured in the Airflow UI.
+
+---
+
+## 2. Exchange Rates ETL Pipeline (`dags/exchange_rate_pipeline.py`)
+
+Automates daily FX rate collection so PayNaija's finance team can convert transaction values across countries into a common reporting currency, replacing a manual daily lookup.
+
+**Tasks:** `extract_raw_exchange_rates` → `transform_exchange_rates` → `load_clean_exchange_rates`
+
+- **Extract** — Calls the [open ExchangeRate-API endpoint](https://www.exchangerate-api.com/docs/free) (no key required), validates both the HTTP response and the response body's own `result` field, and checks each target currency (NGN, GHS, KES) individually for presence and validity — logging a warning and proceeding with whatever's usable rather than hard-failing on a single missing currency. The exact, untouched JSON payload is appended to an **immutable** `raw_exchange_rates` audit table (no upsert — every fetch gets its own row), so any historical API response can be inspected later.
+- **Transform** — Re-reads the raw JSON by its exact row ID (passed via XCom, avoiding any race condition with concurrent runs), independently re-derives currency validity, and reshapes the data into a long/narrow format (one row per currency) for easy filtering and future extensibility.
+- **Load** — Bulk-upserts the small in-memory record list into a `clean_exchange_rates` reporting table via `psycopg2.extras.execute_values`, keyed on the composite `UNIQUE (logical_date, currency_code)`, with `ON CONFLICT ... DO UPDATE` — so a later, corrected fetch for the same day overwrites the earlier one, while the raw table still preserves every fetch that ever happened.
+
+**Design decisions worth noting:**
+- **Bronze/silver pattern** — `raw_exchange_rates` is an append-only source of truth; `transform` is a pure, re-runnable function over it (no dependency on any other task's intermediate state), and `clean_exchange_rates` is the single current-truth row per date/currency for reporting.
+- **XCom sized deliberately** — the raw JSON payload is never passed through XCom (write it to Postgres instead, for audit durability); the final ~3-row cleaned record list is small enough to pass through XCom directly, skipping an unnecessary intermediate file.
+- **Referential integrity** — `clean_exchange_rates.source_raw_id` is a foreign key into `raw_exchange_rates(id)`, so every reporting row is traceable back to the exact raw fetch it came from.
+
+---
 
 ## Tech stack
 
 - Apache Airflow (TaskFlow API)
-- Python (pandas, numpy)
+- Python (pandas, numpy, requests, psycopg2)
 - PostgreSQL
 
 ## Status
 
-🚧 Work in progress — part of a progressive Airflow learning series. Current stage: basic ETL with idempotent loading (scheduling, retries, and logging polish coming next).
+🚧 Work in progress — part of a progressive Airflow learning series (8 planned projects). Completed so far: basic ETL with idempotent loading, retries/logging hardening, and an API-based bronze/silver ingestion pattern. Next up: `FileSensor`-based pipelines that wait for late-arriving files rather than assuming they're already there.
 
 ## Project structure
 
 ```
-signups-etl-pipeline/
+paynaija-airflow-pipelines/
 ├── dags/
-│   └── signups_etl_pipeline.py
+│   ├── signups_etl_pipeline.py
+│   └── exchange_rate_pipeline.py
 ├── data/
 │   └── sample_signups.csv
 ├── requirements.txt
