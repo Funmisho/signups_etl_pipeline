@@ -2,10 +2,11 @@
 
 A progressive Apache Airflow learning project, built one project at a time as part of a structured mentorship series. Each DAG models a realistic business problem for a fictional fintech, **PayNaija**, and is reviewed/hardened like a production system rather than a tutorial exercise.
 
-Currently contains two independent DAGs:
+Currently contains three independent DAGs:
 
 - **`signups_etl_pipeline`** — daily customer signups CSV → Postgres
 - **`exchange_rates_etl_pipeline`** — daily FX rate enrichment from a public API → Postgres
+- **`bank_settlement_sensor_pipeline`** — waits for a late-arriving bank settlement file before processing it
 
 ---
 
@@ -51,6 +52,22 @@ Automates daily FX rate collection so PayNaija's finance team can convert transa
 
 ---
 
+## 3. Bank Settlement Sensor Pipeline (`dags/bank_settlement_pipeline.py`)
+
+Handles a file this team doesn't control: a daily bank settlement export dropped by Treasury Ops sometime "in the morning," with no fixed, reliable arrival time (historically anywhere from 6am to past 11am). Instead of assuming the file is already there (like `signups_etl_pipeline` does), this pipeline actively waits for it, within reason.
+
+**Tasks:** `wait_for_settlement_file` (`FileSensor`) → `process_settlement_file`
+
+- **Wait for file** — A `FileSensor` polls for `/tmp/settlement_file.csv` every 5 minutes (`poke_interval=300`), for up to 7 hours (`timeout=timedelta(hours=7)`), running in `mode="reschedule"` so it releases its worker slot between checks instead of blocking a slot for hours doing nothing. If the file never shows up within the window, the sensor hard-fails (`soft_fail=False`) so on-call is alerted clearly, rather than the run silently skipping.
+- **Process file** — Once the sensor confirms the file exists, re-verifies its presence defensively (guarding against the narrow window between the sensor's last successful poke and the task actually opening the file) before reading and logging its contents.
+
+**Design decisions worth noting:**
+- **`reschedule` over `poke` mode** — since the wait can span hours, holding a worker slot the whole time would needlessly starve other DAGs of execution capacity.
+- **Duration-based `timeout`, accepted deliberately** — Airflow's sensor `timeout` counts from actual task start, not a fixed wall-clock deadline, so a delayed scheduler start could theoretically push the cutoff later. Treated as an acceptable tradeoff here: a rare, minor delay in giving up is preferable to the complexity of building a true fixed-clock cutoff, and to the risk of false-alarming while the file is still legitimately expected.
+- **Fail loud, not silent** — `soft_fail=False` ensures a genuine "file never arrived" scenario surfaces as a clear task failure (and alert), distinct from other kinds of pipeline errors.
+
+---
+
 ## Tech stack
 
 - Apache Airflow (TaskFlow API)
@@ -59,7 +76,7 @@ Automates daily FX rate collection so PayNaija's finance team can convert transa
 
 ## Status
 
-🚧 Work in progress — part of a progressive Airflow learning series (8 planned projects). Completed so far: basic ETL with idempotent loading, retries/logging hardening, and an API-based bronze/silver ingestion pattern. Next up: `FileSensor`-based pipelines that wait for late-arriving files rather than assuming they're already there.
+🚧 Work in progress — part of a progressive Airflow learning series (8 planned projects). Completed so far: basic ETL with idempotent loading, retries/logging hardening, an API-based bronze/silver ingestion pattern, and a `FileSensor`-based pipeline that waits for a late-arriving file rather than assuming it's already there. Next up: Airflow Variables and Jinja templating.
 
 ## Project structure
 
@@ -67,7 +84,8 @@ Automates daily FX rate collection so PayNaija's finance team can convert transa
 paynaija-airflow-pipelines/
 ├── dags/
 │   ├── signups_etl_pipeline.py
-│   └── exchange_rate_pipeline.py
+│   ├── exchange_rate_pipeline.py
+│   └── bank_settlement_pipeline.py
 ├── data/
 │   └── sample_signups.csv
 ├── requirements.txt
