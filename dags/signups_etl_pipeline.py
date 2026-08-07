@@ -1,19 +1,16 @@
 import os
+import re
+import logging
 from datetime import datetime, timedelta
+
 from airflow.decorators import dag, task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 import pandas as pd
 import numpy as np
-import re
 from airflow.operators.python import get_current_context
-import logging
+from airflow.models import Variable
 
 logger = logging.getLogger(__name__)
-
-# Define explicit paths for Airflow's environment
-INPUT_FILE_PATH = "/tmp/signups.csv"
-CLEAN_OUTPUT_PATH = "/tmp/cleaned_signups.csv"
-REJECTED_OUTPUT_PATH = "/tmp/rejected_signups.csv"
 
 # define dag using DAG decorator
 @dag(
@@ -25,32 +22,40 @@ REJECTED_OUTPUT_PATH = "/tmp/rejected_signups.csv"
 def signups_etl_pipeline():
 
     @task()
-    def extract(filepath: str) -> str:
+    def extract() -> str:
         """Checks if csv file exists and isn't empty.
          Returns the filepath string for the next task.
          """
 
+        # Fetch path from Airflow Variable inside task execution context
+        input_filepath = Variable.get("SIGNUPS_INPUT_PATH")
+
         # does the file exist?
-        if not os.path.exists(filepath):
+        if not os.path.exists(input_filepath):
             raise FileNotFoundError(
-                f"Extraction failed: File '{filepath}' does not exist."
+                f"Extraction failed: File '{input_filepath}' does not exist."
             )
              
         # is the file empty? (i.e size is 0 bytes)
-        if os.path.getsize(filepath) == 0:
+        if os.path.getsize(input_filepath) == 0:
             raise ValueError(
-                f"Extraction failed: File '{filepath}' is empty."
+                f"Extraction failed: File '{input_filepath}' is empty."
             )
         
         # if it passes the check, read and return the data
-        logger.info(f"Success: File verified at '{filepath}'")
-        return filepath
+        logger.info(f"Success: File verified at '{input_filepath}'")
+        return input_filepath
 
     @task()
     def clean_and_split_data(filepath: str) -> dict:
-        """apply data quality rules.
-         separates data into clean and rejected and writes both to disk.
+        """Applies data quality rules.
+         separates data into clean and rejected, and writing both to paths specified in
+         Airflow Variables.
         """
+        # Fetch path from Airflow Variables
+        clean_output_path = Variable.get("SIGNUPS_CLEAN_PATH")
+        rejected_output_path = Variable.get("REJECTED_OUTPUT_PATH")
+
         # read the data handed off from extract step
         data = pd.read_csv(filepath, dtype=str)
 
@@ -106,26 +111,26 @@ def signups_etl_pipeline():
             clean_data = clean_data[~duplicate_mask]
   
         # step 5: write out outputs
-        clean_data.to_csv(CLEAN_OUTPUT_PATH, index=False)
-        rejected_data.to_csv(REJECTED_OUTPUT_PATH, index=False)
+        clean_data.to_csv(clean_output_path, index=False)
+        rejected_data.to_csv(rejected_output_path, index=False)
 
         logger.info(
             "Processing complete! Saved %d clean rows to '%s'", 
             len(clean_data),
-            CLEAN_OUTPUT_PATH,
+            clean_output_path,
         )
 
         if len(rejected_data) > 0:
             logger.warning(
                 "%d rows rejected during data quality checks. Details written to '%s'",
                 len(rejected_data),
-                REJECTED_OUTPUT_PATH,
+                rejected_output_path,
             )
 
         # pass the output path downstream to load task
         return {
-            "clean_path" : CLEAN_OUTPUT_PATH,
-            "rejected_path" : REJECTED_OUTPUT_PATH,
+            "clean_path" : clean_output_path,
+            "rejected_path" : rejected_output_path,
         }
 
     @task(
@@ -222,7 +227,7 @@ def signups_etl_pipeline():
         logger.info("Idempotent load completed successfully.")
 
     # Setting up pipeline dependencies
-    file_path = extract(INPUT_FILE_PATH)
+    file_path = extract()
     paths = clean_and_split_data(file_path)
     load_data(paths)
 
