@@ -6,7 +6,10 @@ from airflow.sensors.filesystem import FileSensor
 
 logger = logging.getLogger(__name__)
 
-SETTLEMENT_FILE_PATH = "/tmp/settlement_file.csv"
+# Template combining the Airflow Variable and the execution logical date {{ ds }}
+TEMPLATED_SETTLEMENT_PATH = (
+    "{{ var.value.SETTLEMENT_FILE_DIR }}/settlement_{{ ds }}.csv"
+)
 
 @dag(
     dag_id="bank_settlement_sensor_pipeline",
@@ -20,7 +23,7 @@ def bank_settlement_sensor_pipeline():
     # Sensor Task: Wait for file arrival
     wait_for_settlement_file = FileSensor(
         task_id="wait_for_settlement_file",
-        filepath=SETTLEMENT_FILE_PATH,
+        filepath=TEMPLATED_SETTLEMENT_PATH,
         poke_interval=300, # Check every 300 seconds,
         timeout=timedelta(hours=7), # 7 hours cutoff duration
         mode="reschedule", # releases worker slots back to pool while sleeping
@@ -49,8 +52,9 @@ def bank_settlement_sensor_pipeline():
         if lines:
             logger.info("Sample preview:\n%s", "".join(lines[:5]))
 
-    # Set dependency
-    wait_for_settlement_file >> process_settlement_file(SETTLEMENT_FILE_PATH)
+    # Setting dependency, passing TEMPLATED_SETTLEMENT_PATH to the @task function lets Airflow
+    # render the Jinja string before executing the task body.
+    wait_for_settlement_file >> process_settlement_file(TEMPLATED_SETTLEMENT_PATH)
 
 
 dag_instance = bank_settlement_sensor_pipeline() 
