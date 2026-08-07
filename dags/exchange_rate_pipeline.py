@@ -7,12 +7,11 @@ from airflow.decorators import task, dag
 from airflow.operators.python import get_current_context
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from psycopg2.extras import execute_values
+from airflow.models import Variable
 
 
 logger = logging.getLogger(__name__)
 
-EXCHANGE_RATE_API_URL = "https://open.er-api.com/v6/latest/USD"
-REQUIRED_CURRENCIES = ["NGN", "GHS", "KES"]
 
 @dag(
     dag_id="exchange_rates_etl_pipeline",
@@ -25,22 +24,26 @@ def exchange_rates_etl_pipeline():
 
     @task()
     def extract_raw_exchange_rates() -> dict:
-        """Fetches raw exchange rates from API, performs semantic validation,
+        """Fetches raw exchange rates from API configured via Airflow Variable,
 
-        and appends the exact JSON response into an immutable audit table in Postgres.
+        performs semantic validation, and appends the exact JSON response into 
+        an immutable audit table in Postgres.
 
         Returns:
             dict: Contains 'raw_id' (exact DB row ID) and 'logical_date'
-            string
-                  to eliminate race conditions in downstream tasks.
+            string.
         """
+        # Fetch configurations from Airflow Variables inside task execution context
+        exchange_rates_api_url = Variable.get("EXCHANGE_RATE_API_URL")
+        required_currencies = Variable.get("REQUIRED_CURRENCIES", deserialize_json=True)
+
         context = get_current_context()
         logical_date_str = context["logical_date"].strftime("%Y-%m-%d")
 
         logger.info("Fetching exchange rate for execution date: %s", logical_date_str)
 
         # HTTP Network Fetch
-        response = requests.get(EXCHANGE_RATE_API_URL, timeout=10)
+        response = requests.get(exchange_rates_api_url, timeout=10)
         response.raise_for_status()
 
         # Safe JSON parsing
@@ -62,7 +65,7 @@ def exchange_rates_etl_pipeline():
         valid_rates = {}
 
         # Explicitly inspect each target currency to catch partial payload drops
-        for currency in REQUIRED_CURRENCIES:
+        for currency in required_currencies:
             if currency not in rates:
                 missing_currencies.append(currency)
             else:
@@ -88,7 +91,7 @@ def exchange_rates_etl_pipeline():
         # Hard stop only if ALL target currencies fail
         if not valid_rates:
             raise ValueError(
-                f"Extraction failed: None of the target currencies {REQUIRED_CURRENCIES} "
+                f"Extraction failed: None of the target currencies {required_currencies} "
                 f"were present or valid in the API response."
             )
 
@@ -117,7 +120,7 @@ def exchange_rates_etl_pipeline():
         values = (
             logical_date_str,
             datetime.utcnow(), 
-            EXCHANGE_RATE_API_URL, 
+            exchange_rates_api_url, 
             json.dumps(raw_json_data),
         )
 
@@ -152,6 +155,9 @@ def exchange_rates_etl_pipeline():
         raw_id = extract_metadata["raw_id"]
         logical_date_str = extract_metadata["logical_date"]
 
+        # Fetch target currencies from Airflow Variable
+        required_currencies = Variable.get("REQUIRED_CURRENCIES", deserialize_json=True)
+
         logger.info("Starting transformation for raw_id: %d (Date: %s)", raw_id, logical_date_str)
 
         # Fetch extract raw JSON payload using primary keys
@@ -178,7 +184,7 @@ def exchange_rates_etl_pipeline():
         missing_or_invalid = []
 
         # Shape into tall/narrow format (1 row per valid currency)
-        for currency in REQUIRED_CURRENCIES:
+        for currency in required_currencies:
             rate_val = rates.get(currency)
 
             # Validate it returns a positive number
@@ -203,7 +209,7 @@ def exchange_rates_etl_pipeline():
         # Hard failure only if transformation yields 0 usable records
         if not cleaned_records:
             raise ValueError(
-                f"Transformation failed for raw_id {raw_id}: None of {REQUIRED_CURRENCIES} "
+                f"Transformation failed for raw_id {raw_id}: None of {required_currencies} "
                 f"could be parsed into valid rates."
             )
 
