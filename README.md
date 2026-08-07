@@ -1,82 +1,72 @@
 # PayNaija Data Engineering Pipelines
 
-A progressive Apache Airflow learning project, built one project at a time as part of a structured mentorship series. Each DAG models a realistic business problem for a fictional fintech, **PayNaija**, and is reviewed/hardened like a production system rather than a tutorial exercise.
+I'm using a fictional fintech, **PayNaija**, as the backdrop for a series of Airflow projects I'm building through a structured mentorship — each one starts as a business problem, gets designed before any code is written, and gets reviewed like a real PR before I move on. This repo is where that work lives.
 
-Currently contains three independent DAGs:
+Three DAGs so far, each one built to force a different set of decisions rather than just practice new syntax:
 
-- **`signups_etl_pipeline`** — daily customer signups CSV → Postgres
-- **`exchange_rates_etl_pipeline`** — daily FX rate enrichment from a public API → Postgres
-- **`bank_settlement_sensor_pipeline`** — waits for a late-arriving bank settlement file before processing it
-
----
-
-## 1. Signups ETL Pipeline (`dags/signups_etl_pipeline.py`)
-
-Automates what used to be a manual process: an analyst cleaning a daily `signups.csv` export in Excel and pasting it into a reporting spreadsheet for the BI team.
-
-**Tasks:** `extract` → `clean_and_split_data` → `load_data`
-
-- **Extract** — Verifies the incoming CSV exists and isn't empty before any processing begins.
-- **Clean & Split** — Applies data quality rules and separates records into two outputs:
-  - `cleaned_signups.csv` — valid rows, ready to load
-  - `rejected_signups.csv` — rows with missing `signup_id`/`email` or exact duplicates, each tagged with a `rejection_reason` so nothing disappears without a trace
-- **Load** — Loads clean rows into a `customer_signups` Postgres table using a run-scoped staging table (cloned from the production schema via `LIKE ... INCLUDING ALL`) and an `INSERT ... ON CONFLICT (signup_id) DO NOTHING` upsert, so retries and overlapping runs are safe.
-
-**Reliability hardening:**
-- Per-task retry tuning based on actual failure characteristics — `extract`/`clean_and_split_data` don't retry (their failures are deterministic), `load_data` retries with exponential backoff (its failures are typically transient DB/network issues).
-- Structured `logging` throughout (INFO for progress, WARNING for rejected/anomalous data) instead of `print()`.
-- A `try/finally` block guarantees the run-scoped staging table is dropped even if the load partially fails, preventing orphaned tables from piling up after exhausted retries.
-
-**Design decisions worth noting:**
-- **Modularity over convenience** — extract, clean, and load are separate tasks so each can fail, retry, and be tested independently.
-- **No dropped rows** — every row that fails validation is preserved in a rejected file with a reason, rather than vanishing.
-- **String-typed IDs everywhere** — `signup_id` is read as a string (`dtype=str`) at every point the pipeline touches a CSV, preventing pandas from silently stripping leading zeros or misinterpreting alphanumeric IDs as integers.
-- **Credentials via Airflow Connections** — Postgres credentials are never hardcoded; the DAG references a `postgres_conn_id` configured in the Airflow UI.
+| DAG | What it solves | What it forced me to think about |
+|---|---|---|
+| `signups_etl_pipeline` | Replaces a manual daily Excel cleanup of a customer signups export | Idempotent loading, not silently dropping bad rows |
+| `exchange_rates_etl_pipeline` | Pulls daily FX rates from a public API for finance reporting | Raw vs. cleaned data (bronze/silver), API failure modes |
+| `bank_settlement_sensor_pipeline` | Waits for a settlement file that lands at an unpredictable time each morning | Sensors, worker slot cost, when to give up waiting |
 
 ---
 
-## 2. Exchange Rates ETL Pipeline (`dags/exchange_rate_pipeline.py`)
+## `signups_etl_pipeline.py`
 
-Automates daily FX rate collection so PayNaija's finance team can convert transaction values across countries into a common reporting currency, replacing a manual daily lookup.
+**The problem:** an analyst was manually cleaning a daily `signups.csv` export in Excel and pasting it into a spreadsheet the BI team read from. Slow, and every "quick fix" to a bad row was invisible to everyone else.
 
-**Tasks:** `extract_raw_exchange_rates` → `transform_exchange_rates` → `load_clean_exchange_rates`
+**How it's structured:** `extract → clean_and_split_data → load_data`, kept as three separate tasks on purpose — if a transformation bug shows up later, I don't want to be forced to re-touch the extract logic (or re-hit an external system) just to fix it.
 
-- **Extract** — Calls the [open ExchangeRate-API endpoint](https://www.exchangerate-api.com/docs/free) (no key required), validates both the HTTP response and the response body's own `result` field, and checks each target currency (NGN, GHS, KES) individually for presence and validity — logging a warning and proceeding with whatever's usable rather than hard-failing on a single missing currency. The exact, untouched JSON payload is appended to an **immutable** `raw_exchange_rates` audit table (no upsert — every fetch gets its own row), so any historical API response can be inspected later.
-- **Transform** — Re-reads the raw JSON by its exact row ID (passed via XCom, avoiding any race condition with concurrent runs), independently re-derives currency validity, and reshapes the data into a long/narrow format (one row per currency) for easy filtering and future extensibility.
-- **Load** — Bulk-upserts the small in-memory record list into a `clean_exchange_rates` reporting table via `psycopg2.extras.execute_values`, keyed on the composite `UNIQUE (logical_date, currency_code)`, with `ON CONFLICT ... DO UPDATE` — so a later, corrected fetch for the same day overwrites the earlier one, while the raw table still preserves every fetch that ever happened.
+The part I spent the most time getting right wasn't the cleaning logic — it was making the load idempotent. Every run builds a run-scoped staging table (cloned from `customer_signups` via `LIKE ... INCLUDING ALL`, so type mismatches get caught by Postgres instead of silently coerced by pandas), and only merges into production with `ON CONFLICT (signup_id) DO NOTHING`. A `try/finally` around that block makes sure the staging table gets dropped even if the merge fails partway — otherwise a bad retry leaves orphaned tables behind forever.
 
-**Design decisions worth noting:**
-- **Bronze/silver pattern** — `raw_exchange_rates` is an append-only source of truth; `transform` is a pure, re-runnable function over it (no dependency on any other task's intermediate state), and `clean_exchange_rates` is the single current-truth row per date/currency for reporting.
-- **XCom sized deliberately** — the raw JSON payload is never passed through XCom (write it to Postgres instead, for audit durability); the final ~3-row cleaned record list is small enough to pass through XCom directly, skipping an unnecessary intermediate file.
-- **Referential integrity** — `clean_exchange_rates.source_raw_id` is a foreign key into `raw_exchange_rates(id)`, so every reporting row is traceable back to the exact raw fetch it came from.
+Rejected rows (missing `signup_id`, missing `email`, exact duplicates) never just disappear — they land in `rejected_signups.csv` with a `rejection_reason` column, so if finance ever asks "why did we only get 340 signups yesterday," there's an actual answer instead of a shrug.
+
+`signup_id` is read as a string (`dtype=str`) at every single point this pipeline touches a CSV — I got burned by this once in an earlier draft, where pandas quietly turned `00123` into `123`.
+
+Retries are tuned per task rather than applied blanket: `extract` and `clean_and_split_data` don't retry, since their failures are deterministic and retrying just delays the same failure. `load_data` retries with exponential backoff, since its failures are usually a transient DB hiccup.
 
 ---
 
-## 3. Bank Settlement Sensor Pipeline (`dags/bank_settlement_pipeline.py`)
+## `exchange_rate_pipeline.py`
 
-Handles a file this team doesn't control: a daily bank settlement export dropped by Treasury Ops sometime "in the morning," with no fixed, reliable arrival time (historically anywhere from 6am to past 11am). Instead of assuming the file is already there (like `signups_etl_pipeline` does), this pipeline actively waits for it, within reason.
+**The problem:** finance needs daily NGN/GHS/KES → USD rates, currently looked up manually.
 
-**Tasks:** `wait_for_settlement_file` (`FileSensor`) → `process_settlement_file`
+This one's built around a pattern I hadn't used before this project: keep the *raw* API response and the *cleaned* version in two separate tables. `raw_exchange_rates` is append-only — every fetch gets its own row, nothing is ever updated or deleted, so if an auditor asks "what did the API actually say on July 27th," that question is always answerable. `transform_exchange_rates` reads that raw JSON back out by its exact row ID (not by date — two runs on the same day would otherwise race) and reshapes it into `clean_exchange_rates`, one row per currency, upserted on `(logical_date, currency_code)` so a same-day correction from the API overwrites cleanly.
 
-- **Wait for file** — A `FileSensor` polls for `/tmp/settlement_file.csv` every 5 minutes (`poke_interval=300`), for up to 7 hours (`timeout=timedelta(hours=7)`), running in `mode="reschedule"` so it releases its worker slot between checks instead of blocking a slot for hours doing nothing. If the file never shows up within the window, the sensor hard-fails (`soft_fail=False`) so on-call is alerted clearly, rather than the run silently skipping.
-- **Process file** — Once the sensor confirms the file exists, re-verifies its presence defensively (guarding against the narrow window between the sensor's last successful poke and the task actually opening the file) before reading and logging its contents.
+`extract_raw_exchange_rates` treats a missing currency as a warning, not a hard failure — if `GHS` is temporarily absent from the API response but `NGN` and `KES` came through fine, the pipeline still loads what it has and logs exactly what's missing, rather than losing all three currencies over one gap.
 
-**Design decisions worth noting:**
-- **`reschedule` over `poke` mode** — since the wait can span hours, holding a worker slot the whole time would needlessly starve other DAGs of execution capacity.
-- **Duration-based `timeout`, accepted deliberately** — Airflow's sensor `timeout` counts from actual task start, not a fixed wall-clock deadline, so a delayed scheduler start could theoretically push the cutoff later. Treated as an acceptable tradeoff here: a rare, minor delay in giving up is preferable to the complexity of building a true fixed-clock cutoff, and to the risk of false-alarming while the file is still legitimately expected.
-- **Fail loud, not silent** — `soft_fail=False` ensures a genuine "file never arrived" scenario surfaces as a clear task failure (and alert), distinct from other kinds of pipeline errors.
+`clean_exchange_rates.source_raw_id` is a foreign key back into `raw_exchange_rates`, so every reporting row is traceable to the exact fetch it came from — not just "some run that day."
+
+---
+
+## `bank_settlement_pipeline.py`
+
+**The problem:** Treasury Ops drops a settlement file "sometime in the morning" — anywhere from 6am to past 11am, sometimes not at all. This pipeline needed to wait, but not forever, and not by blocking a worker the whole time.
+
+A `FileSensor` polls every 5 minutes in `mode="reschedule"`, which frees the worker slot between checks instead of holding it hostage for potentially hours — `poke` mode would've been fine for a 30-second wait, but not for this. It gives up after 7 hours and fails loudly (`soft_fail=False`) rather than silently skipping, since "the file never showed up" needs to page someone, not vanish quietly.
+
+One thing worth knowing if you're reading the timeout logic: it's duration-based (7 hours from actual task start), not a fixed wall-clock deadline. A delayed scheduler start could theoretically push the cutoff a bit later. I decided that's an acceptable tradeoff for now — false-alarming while the file is still legitimately expected felt like the worse failure mode to build around.
+
+---
+
+## Config: what's a Variable, what stays in code
+
+File paths (`SIGNUPS_INPUT_PATH`, `SIGNUPS_CLEAN_PATH`, `SIGNUPS_REJECTED_PATH`, `SETTLEMENT_FILE_DIR`), the FX API URL, and the required currency list all live in **Airflow Variables** now, editable from the UI without a code deploy. Retry counts, table names, and sensor poke/timeout values stayed in code — those are implementation details a data engineer would change alongside other code, not something ops needs to tweak on their own.
+
+The settlement file path is also **Jinja-templated** — `{{ var.value.SETTLEMENT_FILE_DIR }}/settlement_{{ ds }}.csv` — so each run resolves to that day's actual file (`settlement_2026-08-05.csv`) instead of pretending there's only ever one file, forever.
+
+One rule I'm sticking to: `Variable.get()` never gets called at DAG-file top level, only inside task bodies. Calling it at the top level means it re-runs on *every scheduler parse cycle*, not just when the DAG actually executes — a real, documented cause of scheduler slowdowns in production Airflow.
 
 ---
 
 ## Tech stack
 
-- Apache Airflow (TaskFlow API)
-- Python (pandas, numpy, requests, psycopg2)
-- PostgreSQL
+Apache Airflow (TaskFlow API), Python (pandas, numpy, requests, psycopg2), PostgreSQL.
 
 ## Status
 
-🚧 Work in progress — part of a progressive Airflow learning series (8 planned projects). Completed so far: basic ETL with idempotent loading, retries/logging hardening, an API-based bronze/silver ingestion pattern, and a `FileSensor`-based pipeline that waits for a late-arriving file rather than assuming it's already there. Next up: Airflow Variables and Jinja templating.
+8-project mentorship series. Done: modular idempotent ETL, retry/logging hardening, a bronze/silver API ingestion pattern, a sensor-based wait pipeline, and Airflow Variables + Jinja templating. Next: branching — teaching these DAGs to make runtime decisions instead of always doing the same thing.
 
 ## Project structure
 
