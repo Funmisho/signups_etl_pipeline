@@ -7,7 +7,7 @@ Three DAGs so far, each one built to force a different set of decisions rather t
 | DAG | What it solves | What it forced me to think about |
 |---|---|---|
 | `signups_etl_pipeline` | Replaces a manual daily Excel cleanup of a customer signups export | Idempotent loading, not silently dropping bad rows |
-| `exchange_rates_etl_pipeline` | Pulls daily FX rates from a public API for finance reporting | Raw vs. cleaned data (bronze/silver), API failure modes |
+| `exchange_rates_etl_pipeline` | Pulls daily FX rates from a public API for finance reporting | Raw vs. cleaned data (bronze/silver), API failure modes, branching on anomalous rates |
 | `bank_settlement_sensor_pipeline` | Waits for a settlement file that lands at an unpredictable time each morning | Sensors, worker slot cost, when to give up waiting |
 
 ---
@@ -38,6 +38,12 @@ This one's built around a pattern I hadn't used before this project: keep the *r
 
 `clean_exchange_rates.source_raw_id` is a foreign key back into `raw_exchange_rates`, so every reporting row is traceable to the exact fetch it came from — not just "some run that day."
 
+**Branching on anomalies:** finance once had a bad GHS rate — a 40% overnight jump from a bad data point at the provider — go straight into `clean_exchange_rates` unnoticed. Now, after `transform_exchange_rates` runs, a `check_for_anomalies` task compares each currency's new rate against yesterday's *loaded* rate (a fresh query against `clean_exchange_rates`, not something carried over in memory — `transform` never had yesterday's value to begin with). Any currency that swings more than `ANOMALY_THRESHOLD_PERCENTAGE` (an Airflow Variable, 15% by default) routes the whole run to a `flagged_exchange_rates` table instead of production — same schema as the clean table, plus `previous_rate_to_usd` and `percentage_change`, so a reviewer sees the full picture without going and finding the raw data themselves.
+
+The branching decision itself is split into two tasks on purpose: `check_for_anomalies` does the actual math and packages a decision, and a separate `route_decision` (the one wearing `@task.branch()`) just reads that decision and tells Airflow which path to take. They could've been one task, but keeping "compute" and "route" separate meant I could reason about each independently, and it's obvious from the Grid view alone which branch a given day took.
+
+The one edge case that took real thought: what happens the very first time this DAG runs, when there's no "yesterday" row to compare against? Flagging Day 1 as anomalous by default would mean Day 2 also has no valid baseline (since nothing loaded on Day 1) — a permanent lockout where a human has to manually intervene every single day forever. Cold start is treated as normal instead, on the reasoning that you can't meaningfully call something "a 40% jump" with nothing to jump from.
+
 ---
 
 ## `bank_settlement_pipeline.py`
@@ -66,7 +72,7 @@ Apache Airflow (TaskFlow API), Python (pandas, numpy, requests, psycopg2), Postg
 
 ## Status
 
-8-project mentorship series. Done: modular idempotent ETL, retry/logging hardening, a bronze/silver API ingestion pattern, a sensor-based wait pipeline, and Airflow Variables + Jinja templating. Next: branching — teaching these DAGs to make runtime decisions instead of always doing the same thing.
+8-project mentorship series. Done: modular idempotent ETL, retry/logging hardening, a bronze/silver API ingestion pattern, a sensor-based wait pipeline, Airflow Variables + Jinja templating, and branching (the exchange rate pipeline now routes suspicious rate swings to a review table instead of loading them). Next: triggering one DAG from another, plus callbacks and email notifications — giving `flagged_exchange_rates` an actual reason to alert someone.
 
 ## Project structure
 
