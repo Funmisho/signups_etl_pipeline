@@ -1,17 +1,18 @@
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List
+
 import requests
 from airflow.decorators import task, dag
 from airflow.operators.python import get_current_context
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from psycopg2.extras import execute_values
 from airflow.models import Variable
+from airflow.utils.trigger_rule import TriggerRule
 
 
 logger = logging.getLogger(__name__)
-
 
 @dag(
     dag_id="exchange_rates_etl_pipeline",
@@ -223,12 +224,122 @@ def exchange_rates_etl_pipeline():
         # pass list of dicts directly in memory via Xcom
         return cleaned_records
 
+    # BRANCH TASK: Evaluate Anomaly Thresholds and Route Execution
+    @task()
+    def check_for_anomalies(
+        cleaned_records: List[Dict[str, Any]]
+    )-> Dict[str, Any]:
+        """Queries clean_exchange_rates for yesterday's baseline, compares percent
+
+        changes against ANOMALY_THRESHOLD_PERCENTAGE, and returns XCom metadata
+        alongside the winning target task_id.
+        """
+        # Fetch threshold from Airflow Variable
+        threshold = float(
+            Variable.get("ANOMALY_THRESHOLD_PERCENTAGE", default_var="0.15")
+        )
+
+        context = get_current_context()
+        logical_date = context["logical_date"].date()
+        logical_date_str = logical_date.strftime("%Y-%m-%d")
+        yesterday_str = (logical_date - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        logger.info(
+            "Evaluating rates for %s against baseline %s with threshold %.2f%%...",
+            logical_date_str,
+            yesterday_str,
+            threshold * 100,
+        )
+
+        # SQL query fetching all baseline rates for yesterday
+        pg_hook = PostgresHook(postgres_conn_id="my_postgres_conn")
+        baseline_sql = """
+            SELECT currency_code, rate_to_usd
+            FROM clean_exchange_rates
+            WHERE logical_date = %s;
+        """
+
+        yesterday_rates = {}
+        with pg_hook.get_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(baseline_sql, (yesterday_str,))
+                rows = cursor.fetchall()
+                for currency_code, rate in rows:
+                    yesterday_rates[currency_code] = float(rate)
+
+        # if no historical baseline exists, route as NORMAL
+        if not yesterday_rates:
+            logger.info(
+                "No previous day records found for %s (cold start). Routing to normal load.",
+                yesterday_str
+            )
+            return {
+                "target_task" : "load_clean_exchange_rates",
+                "enriched_records" : [],
+            }
+
+        is_anomalous = False
+        enriched_records = []
+
+        for record in cleaned_records:
+            currency = record["currency_code"]
+            current_rate = record["rate_to_usd"]
+            prev_rate = yesterday_rates.get(currency)
+
+            pct_change = None
+            if prev_rate and prev_rate > 0:
+                pct_change = abs(current_rate - prev_rate) / prev_rate
+                if pct_change > threshold:
+                    is_anomalous = True
+                    logger.warning(
+                        "ANOMALY DETECTED for %s on %s: Yesterday=%.6f, Today=%.6f (%.2f%% change > %.2f%% threshold)",
+                        currency,
+                        logical_date_str,
+                        prev_rate,
+                        current_rate,
+                        pct_change * 100,
+                        threshold * 100,
+                    )
+
+            enriched_records.append({
+                "logical_date" : record["logical_date"],
+                "currency_code" : currency,
+                "rate_to_usd" : current_rate,
+                "previous_rate_to_usd" : prev_rate,
+                "percentage_change" : (
+                    round(pct_change, 4) if pct_change is not None else None
+                ),
+                "source_raw_id" : record["source_raw_id"],
+            })
+
+        # Return target task ID for branching, embedding enriched payload in XCom
+        if is_anomalous:
+            logger.warning(
+                "Routing run %s to 'flag_anomalous_rates' due to detected anomalies.",
+                logical_date_str,
+            )
+            return {
+                "target_task" : "flag_anomalous_rates",
+                "enriched_records" : enriched_records
+            }
+
+        logger.info(
+            "All rate changes for %s within nominal limits. Routing to 'load_clean_exchange_rates'.",
+            logical_date_str
+        )
+        return {
+            "target_task" : "load_clean_exchange_rates",
+            "enriched_records" : enriched_records,
+        }
+    # Custom wrapper ensuring TaskFlow extracts the target_task string for branching
+    @task.branch()
+    def route_decision(branch_payload: Dict[str, Any]) -> str:
+        return branch_payload["target_task"]
+
+    # PATH A: Normal Load Task
     @task()
     def load_clean_exchange_rates(clean_records: List[Dict[str, Any]]) -> None:
         """Loads normalized currency records into 'clean_exchange_rates'.
-
-        Executes an atomic, idempotent upsert using psycopg2 execute_values
-        targeting the composite key ON CONFLICT (logical_date, currency_code).
         """
         if not clean_records:
             logger.warning(
@@ -298,10 +409,107 @@ def exchange_rates_etl_pipeline():
             len(clean_records),
         )
 
-    # setting up pipeline dependencies
+    # PATH B: Flagged / Anomalous Load Task
+    @task()
+    def flag_anomalous_rates(branch_payload: Dict[str, Any]) -> None:
+        """Loads anomalous currency records into 'flagged_exchange_rates' with
+        comparison metadata.
+        """
+        enriched_records = branch_payload.get("enriched_records", [])
+        if not enriched_records:
+            logger.warning(
+                "No enriched records recieved in flag_anomalous_rates task."
+            )
+            return
+
+        logger.info(
+            "Recording %d flagged anomalous record(s) for manual review...",
+            len(enriched_records),
+        )
+
+        pg_hook = PostgresHook(postgres_conn_id="my_postgres_conn")
+
+        create_flagged_table_sql = """
+            CREATE TABLE IF NOT EXISTS flagged_exchange_rates (
+                id SERIAL PRIMARY KEY,
+                logical_date DATE NOT NULL,
+                currency_code VARCHAR(3) NOT NULL,
+                rate_to_usd NUMERIC(18, 6) NOT NULL,
+                previous_rate_to_usd NUMERIC(18, 6),
+                percentage_change NUMERIC(8, 4),
+                source_raw_id INT NOT NULL REFERENCES raw_exchange_rates(id),
+                flagged_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT unique_flagged_date_currency UNIQUE(logical_date, currency_code)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_flagged_rates_date
+            ON flagged_exchange_rates (logical_date);
+        """
+
+        upsert_flagged_sql = """
+            INSERT INTO flagged_exchange_rates (
+                logical_date, currency_code, rate_to_usd, previous_rate_to_usd,
+                percentage_change, source_raw_id)
+            VALUES %s
+            ON CONFLICT (logical_date, currency_code)
+            DO UPDATE SET
+                rate_to_usd = EXCLUDED.rate_to_usd,
+                previous_rate_to_usd = EXCLUDED.previous_rate_to_usd,
+                percentage_change = EXCLUDED.percentage_change,
+                source_raw_id = EXCLUDED.source_raw_id,
+                flagged_at = CURRENT_TIMESTAMP
+        """
+
+        records_to_insert = [
+            (
+                rec["logical_date"],
+                rec["currency_code"],
+                rec["rate_to_usd"],
+                rec["previous_rate_to_usd"],
+                rec["percentage_change"],
+                rec["source_raw_id"],
+            )
+            for rec in enriched_records
+        ]
+
+        with pg_hook.get_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(create_flagged_table_sql)
+                execute_values(cursor, upsert_flagged_sql, records_to_insert)
+                conn.commit()
+
+        logger.warning(
+            "Successfully routed and saved %d record(s) to 'flagged_exchange_rates'.",
+            len(enriched_records),
+        )
+
+    # RECONVERGING TASK: Pipeline completion log
+    @task(trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
+    def log_pipeline_completion() -> None:
+        """Executes regardless of which load branch was taken, confirming run completion.
+        """
+        logger.info(
+            "Exchange Rates ETL pipeline completed processing successfully."
+        )
+    
+    # Pipeline Task Execution flow
     raw_meta = extract_raw_exchange_rates()
     cleaned = transform_exchange_rates(raw_meta)
-    load_clean_exchange_rates(cleaned)
+
+    # Branch calculation and routing
+    branch_data = check_for_anomalies(cleaned)
+    selected_route = route_decision(branch_data)
+
+    # Downstream branches
+    normal_load = load_clean_exchange_rates(cleaned)
+    flagged_load = flag_anomalous_rates(branch_data)
+
+    # Wire branching dependencies
+    selected_route >> normal_load
+    selected_route >> flagged_load
+
+    # Reconverge downstream branches into completion task
+    [normal_load, flagged_load] >> log_pipeline_completion()
 
 # Instantiate the DAG
 exchange_rates_etl_pipeline()   
