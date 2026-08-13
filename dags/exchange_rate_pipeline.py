@@ -11,6 +11,8 @@ from psycopg2.extras import execute_values
 from airflow.models import Variable
 from airflow.utils.trigger_rule import TriggerRule
 
+from utils import notify_failure
+
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,7 @@ logger = logging.getLogger(__name__)
     start_date=datetime(2026, 7, 26),
     schedule="@daily",
     catchup=False,
+    default_args={"on_failure_callback": notify_failure},
     tags=["finance", "fx", "api"],
 )
 def exchange_rates_etl_pipeline():
@@ -313,24 +316,14 @@ def exchange_rates_etl_pipeline():
             })
 
         # Return target task ID for branching, embedding enriched payload in XCom
-        if is_anomalous:
-            logger.warning(
-                "Routing run %s to 'flag_anomalous_rates' due to detected anomalies.",
-                logical_date_str,
-            )
-            return {
-                "target_task" : "flag_anomalous_rates",
-                "enriched_records" : enriched_records
-            }
-
-        logger.info(
-            "All rate changes for %s within nominal limits. Routing to 'load_clean_exchange_rates'.",
-            logical_date_str
+        target_task = (
+            "flag_anomalous_rates" if is_anomalous else "load_clean_exchange_rates"
         )
         return {
-            "target_task" : "load_clean_exchange_rates",
-            "enriched_records" : enriched_records,
+            "target_task": target_task,
+            "enriched_records": enriched_records,
         }
+        
     # Custom wrapper ensuring TaskFlow extracts the target_task string for branching
     @task.branch()
     def route_decision(branch_payload: Dict[str, Any]) -> str:
@@ -412,9 +405,12 @@ def exchange_rates_etl_pipeline():
     # PATH B: Flagged / Anomalous Load Task
     @task()
     def flag_anomalous_rates(branch_payload: Dict[str, Any]) -> None:
-        """Loads anomalous currency records into 'flagged_exchange_rates' with
-        comparison metadata.
+        """Saves anomalous records into Postgres with comparison metadata
+        AND outputs the business anomaly alert payload.
         """
+        context = get_current_context()
+        logical_date_str = context["logical_date"].strftime("%Y-%m-%d")
+        
         enriched_records = branch_payload.get("enriched_records", [])
         if not enriched_records:
             logger.warning(
@@ -478,9 +474,16 @@ def exchange_rates_etl_pipeline():
                 execute_values(cursor, upsert_flagged_sql, records_to_insert)
                 conn.commit()
 
+        # Business Anomaly Notification Log (fires AFTER successful DB persistence)
         logger.warning(
-            "Successfully routed and saved %d record(s) to 'flagged_exchange_rates'.",
+            "\n===================================================================\n"
+            "[EMAIL WOULD SEND] To: finance-alerts@paynaija.com |\n"
+            "Subject: Exchange Rate Anomaly Detected (%s) |\n"
+            "Body: %d currencies flagged for manual review: %s\n"
+            "===================================================================",
+            logical_date_str,
             len(enriched_records),
+            [(r["currency_code"], r["percentage_change"]) for r in enriched_records],
         )
 
     # RECONVERGING TASK: Pipeline completion log

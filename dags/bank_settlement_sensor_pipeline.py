@@ -1,8 +1,13 @@
 import logging
 import os
 from datetime import datetime, timedelta
+
 from airflow.decorators import dag, task
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.sensors.filesystem import FileSensor
+from airflow.utils.trigger_rule import TriggerRule
+
+from utils import notify_failure
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +21,7 @@ TEMPLATED_SETTLEMENT_PATH = (
     start_date=datetime(2026, 8, 4),
     schedule="0 6 * * *", # Starts daily at 6:00 AM UTC
     catchup=False,
+    default_args={"on_failure_callback": notify_failure},
     tags=["finance", "treasury", "sensors"],
 ) 
 
@@ -52,9 +58,22 @@ def bank_settlement_sensor_pipeline():
         if lines:
             logger.info("Sample preview:\n%s", "".join(lines[:5]))
 
+    # Cross-DAG Trigger: Kicks off reconciliation_dag upon successful settlement processing
+    trigger_reconciliation = TriggerDagRunOperator(
+        task_id="trigger_reconciliation_dag",
+        trigger_dag_id="reconciliation_dag",
+        reset_dag_run=True, # Clears & re-runs existing DAG run if re-triggered for same date
+        wait_for_completion=False, # Fire-and-forget; doesn't block worker waiting for completion
+    )
+
     # Setting dependency, passing TEMPLATED_SETTLEMENT_PATH to the @task function lets Airflow
     # render the Jinja string before executing the task body.
-    wait_for_settlement_file >> process_settlement_file(TEMPLATED_SETTLEMENT_PATH)
+    # Dependency Chain: Sensor -> Process -> Trigger
+    (
+        wait_for_settlement_file
+        >> process_settlement_file(TEMPLATED_SETTLEMENT_PATH)
+        >> trigger_reconciliation
+    )
 
 
 dag_instance = bank_settlement_sensor_pipeline() 
