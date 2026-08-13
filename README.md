@@ -8,7 +8,8 @@ Three DAGs so far, each one built to force a different set of decisions rather t
 |---|---|---|
 | `signups_etl_pipeline` | Replaces a manual daily Excel cleanup of a customer signups export | Idempotent loading, not silently dropping bad rows |
 | `exchange_rates_etl_pipeline` | Pulls daily FX rates from a public API for finance reporting | Raw vs. cleaned data (bronze/silver), API failure modes, branching on anomalous rates |
-| `bank_settlement_sensor_pipeline` | Waits for a settlement file that lands at an unpredictable time each morning | Sensors, worker slot cost, when to give up waiting |
+| `bank_settlement_sensor_pipeline` | Waits for a settlement file that lands at an unpredictable time each morning | Sensors, worker slot cost, when to give up waiting, triggering another DAG on success |
+| `reconciliation_dag` | Placeholder for weekly finance reconciliation | Cross-DAG triggering, `schedule=None` DAGs driven entirely by another pipeline |
 
 ---
 
@@ -44,6 +45,10 @@ The branching decision itself is split into two tasks on purpose: `check_for_ano
 
 The one edge case that took real thought: what happens the very first time this DAG runs, when there's no "yesterday" row to compare against? Flagging Day 1 as anomalous by default would mean Day 2 also has no valid baseline (since nothing loaded on Day 1) — a permanent lockout where a human has to manually intervene every single day forever. Cold start is treated as normal instead, on the reasoning that you can't meaningfully call something "a 40% jump" with nothing to jump from.
 
+**Notifications:** flagging an anomaly used to just sit quietly in a table until someone thought to check it. Now `flag_anomalous_rates` fires a notification the moment it finishes writing to `flagged_exchange_rates` — currency, old rate, new rate, percentage change, right there in the alert instead of making someone go query for it. I'm not wiring real SMTP for this project, so it's a clearly-labeled `[EMAIL WOULD SEND]` log for now; the point was getting the trigger placement and payload right, not standing up a mail server.
+
+This is a genuinely different kind of alert from a task failure, and it needed a different mechanism. An anomaly isn't Airflow failing at anything — it's the branch working exactly as designed. So it's a direct log call inside `flag_anomalous_rates` itself, not something routed through `on_failure_callback`.
+
 ---
 
 ## `bank_settlement_pipeline.py`
@@ -53,6 +58,14 @@ The one edge case that took real thought: what happens the very first time this 
 A `FileSensor` polls every 5 minutes in `mode="reschedule"`, which frees the worker slot between checks instead of holding it hostage for potentially hours — `poke` mode would've been fine for a 30-second wait, but not for this. It gives up after 7 hours and fails loudly (`soft_fail=False`) rather than silently skipping, since "the file never showed up" needs to page someone, not vanish quietly.
 
 One thing worth knowing if you're reading the timeout logic: it's duration-based (7 hours from actual task start), not a fixed wall-clock deadline. A delayed scheduler start could theoretically push the cutoff a bit later. I decided that's an acceptable tradeoff for now — false-alarming while the file is still legitimately expected felt like the worse failure mode to build around.
+
+Once `process_settlement_file` finishes successfully, a `TriggerDagRunOperator` kicks off `reconciliation_dag` (a minimal placeholder for now — it just logs that it started, since the point of this project was the triggering mechanism, not new reconciliation logic). It sits after `process_settlement_file` specifically so a sensor timeout or a missing file stops the chain before reconciliation ever fires — Airflow's default `all_success` trigger rule means nothing downstream runs unless everything upstream actually succeeded.
+
+---
+
+## Operational failure alerts
+
+Both `exchange_rates_etl_pipeline` and `bank_settlement_sensor_pipeline` now carry a shared `on_failure_callback` (`notify_failure` in `utils.py`), set once at the DAG level rather than per-task — that way a task I add next month gets covered automatically instead of me having to remember to wire it in individually. It's a different kind of alert from the anomaly one above: this fires on genuine Airflow failures (uncaught exceptions, timeouts), not on a business condition the pipeline handled correctly.
 
 ---
 
@@ -72,7 +85,7 @@ Apache Airflow (TaskFlow API), Python (pandas, numpy, requests, psycopg2), Postg
 
 ## Status
 
-8-project mentorship series. Done: modular idempotent ETL, retry/logging hardening, a bronze/silver API ingestion pattern, a sensor-based wait pipeline, Airflow Variables + Jinja templating, and branching (the exchange rate pipeline now routes suspicious rate swings to a review table instead of loading them). Next: triggering one DAG from another, plus callbacks and email notifications — giving `flagged_exchange_rates` an actual reason to alert someone.
+8-project mentorship series. Done: modular idempotent ETL, retry/logging hardening, a bronze/silver API ingestion pattern, a sensor-based wait pipeline, Airflow Variables + Jinja templating, branching on anomalous rates, and cross-DAG triggering with separate business-alert and operational-failure notification paths. Next: Project 8, the capstone — pulling all of this into one cohesive production-style pipeline.
 
 ## Project structure
 
@@ -81,7 +94,9 @@ paynaija-airflow-pipelines/
 ├── dags/
 │   ├── signups_etl_pipeline.py
 │   ├── exchange_rate_pipeline.py
-│   └── bank_settlement_pipeline.py
+│   ├── bank_settlement_pipeline.py
+│   └── reconciliation_dag.py
+├── utils.py
 ├── data/
 │   └── sample_signups.csv
 ├── requirements.txt
