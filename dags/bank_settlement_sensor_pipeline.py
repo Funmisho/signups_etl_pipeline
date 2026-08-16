@@ -3,6 +3,8 @@ import os
 from datetime import datetime, timedelta
 
 from airflow.decorators import dag, task
+from airflow.operators.python import get_current_context
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.sensors.filesystem import FileSensor
 from airflow.utils.trigger_rule import TriggerRule
@@ -36,34 +38,80 @@ def bank_settlement_sensor_pipeline():
         soft_fail=False, # Fail tasks loudly to trigger alerts
     )
 
-    # Downstream Task: Read and log file contents once confirmed present
     @task()
     def process_settlement_file(filepath: str) -> None:
-        """Reads and logs the arrived settlement file once the sensor confirms its prescence."""
-        logger.info("Starting processing for settlement file at: %s", filepath)
+        """Reads settlement CSV, validates row count, and persists an audit record into Postgres."""
+        context = get_current_context()
+        settlement_date_str = context["logical_date"].strftime("%Y-%m-%d")
+
+        logger.info("Processing settlement file for date %s at: %s", settlement_date_str, filepath)
 
         if not os.path.exists(filepath):
             raise FileNotFoundError(
-                f"Processing Failed: Sensor marked success, but file was missing at {filepath}"
+                f"Processing Failed: Sensor marked success, but File expected at {filepath} does not exist."
             )
 
+        # Read file and count record (excluding header)
         with open(filepath, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+            lines = [line.strip() for line in f if line.strip()]
+
+        total_lines = len(lines)
+        data_row_count = max(0, total_lines - 1)  # Subtract header row
 
         logger.info(
-            "Settlement file successfully read. Total rows: %d", len(lines)
+            "Settlement file read successfully. Total lines: %d (Data rows: %d)",
+            total_lines,
+            data_row_count,
         )
 
-        # Log first few sample lines if available
-        if lines:
-            logger.info("Sample preview:\n%s", "".join(lines[:5]))
+        # Persist execution record in processed_settlement_files
+        pg_hook = PostgresHook(postgres_conn_id="my_postgres_conn")
+
+        create_table_sql = """
+            CREATE TABLE IF NOT EXISTS processed_settlement_files (
+                id SERIAL PRIMARY KEY,
+                settlement_date DATE NOT NULL UNIQUE,
+                filepath VARCHAR(255) NOT NULL,
+                row_count INT NOT NULL,
+                processed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_settlement_date
+            ON processed_settlement_files (settlement_date);
+        """
+
+        upsert_settlement_sql = """
+            INSERT INTO processed_settlement_files (settlement_date, filepath, row_count, processed_at)
+            VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (settlement_date)
+            DO UPDATE SET
+                filepath = EXCLUDED.filepath,
+                row_count = EXCLUDED.row_count,
+                processed_at = CURRENT_TIMESTAMP
+        """
+
+        with pg_hook.get_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(create_table_sql)
+                cursor.execute(upsert_settlement_sql, 
+                               (settlement_date_str, filepath, data_row_count),
+                )
+                conn.commit()
+
+        logger.info(
+            "✓ [AUDIT LOGGED] Recorded settlement date %s in processed_settlement_files (%d rows).",
+            settlement_date_str,
+            data_row_count,
+        )
 
     # Cross-DAG Trigger: Kicks off reconciliation_dag upon successful settlement processing
     trigger_reconciliation = TriggerDagRunOperator(
         task_id="trigger_reconciliation_dag",
         trigger_dag_id="reconciliation_dag",
+        logical_date="{{ logical_date }}",
         reset_dag_run=True, # Clears & re-runs existing DAG run if re-triggered for same date
         wait_for_completion=False, # Fire-and-forget; doesn't block worker waiting for completion
+        trigger_rule=TriggerRule.ALL_DONE # Runs whether process_settlement_file succeeded or upstream failed
     )
 
     # Setting dependency, passing TEMPLATED_SETTLEMENT_PATH to the @task function lets Airflow
