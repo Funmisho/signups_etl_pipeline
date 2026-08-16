@@ -2,14 +2,14 @@
 
 I'm using a fictional fintech, **PayNaija**, as the backdrop for a series of Airflow projects I'm building through a structured mentorship — each one starts as a business problem, gets designed before any code is written, and gets reviewed like a real PR before I move on. This repo is where that work lives.
 
-Three DAGs so far, each one built to force a different set of decisions rather than just practice new syntax:
+Four DAGs so far, each one built to force a different set of decisions rather than just practice new syntax:
 
 | DAG | What it solves | What it forced me to think about |
 |---|---|---|
 | `signups_etl_pipeline` | Replaces a manual daily Excel cleanup of a customer signups export | Idempotent loading, not silently dropping bad rows |
 | `exchange_rates_etl_pipeline` | Pulls daily FX rates from a public API for finance reporting | Raw vs. cleaned data (bronze/silver), API failure modes, branching on anomalous rates |
 | `bank_settlement_sensor_pipeline` | Waits for a settlement file that lands at an unpredictable time each morning | Sensors, worker slot cost, when to give up waiting, triggering another DAG on success |
-| `reconciliation_dag` | Placeholder for weekly finance reconciliation | Cross-DAG triggering, `schedule=None` DAGs driven entirely by another pipeline |
+| `reconciliation_dag` | Weekly finance reconciliation across signups, FX rates, and settlements | Cross-DAG data passing, idempotent weekly upserts, resilience to upstream DAGs failing entirely |
 
 ---
 
@@ -39,13 +39,13 @@ This one's built around a pattern I hadn't used before this project: keep the *r
 
 `clean_exchange_rates.source_raw_id` is a foreign key back into `raw_exchange_rates`, so every reporting row is traceable to the exact fetch it came from — not just "some run that day."
 
-**Branching on anomalies:** finance once had a bad GHS rate — a 40% overnight jump from a bad data point at the provider — go straight into `clean_exchange_rates` unnoticed. Now, after `transform_exchange_rates` runs, a `check_for_anomalies` task compares each currency's new rate against yesterday's *loaded* rate (a fresh query against `clean_exchange_rates`, not something carried over in memory — `transform` never had yesterday's value to begin with). Any currency that swings more than `ANOMALY_THRESHOLD_PERCENTAGE` (an Airflow Variable, 15% by default) routes the whole run to a `flagged_exchange_rates` table instead of production — same schema as the clean table, plus `previous_rate_to_usd` and `percentage_change`, so a reviewer sees the full picture without going and finding the raw data themselves.
+**Branching on anomalies (Project 6):** finance once had a bad GHS rate — a 40% overnight jump from a bad data point at the provider — go straight into `clean_exchange_rates` unnoticed. Now, after `transform_exchange_rates` runs, a `check_for_anomalies` task compares each currency's new rate against yesterday's *loaded* rate (a fresh query against `clean_exchange_rates`, not something carried over in memory — `transform` never had yesterday's value to begin with). Any currency that swings more than `ANOMALY_THRESHOLD_PERCENTAGE` (an Airflow Variable, 15% by default) routes the whole run to a `flagged_exchange_rates` table instead of production — same schema as the clean table, plus `previous_rate_to_usd` and `percentage_change`, so a reviewer sees the full picture without going and finding the raw data themselves.
 
 The branching decision itself is split into two tasks on purpose: `check_for_anomalies` does the actual math and packages a decision, and a separate `route_decision` (the one wearing `@task.branch()`) just reads that decision and tells Airflow which path to take. They could've been one task, but keeping "compute" and "route" separate meant I could reason about each independently, and it's obvious from the Grid view alone which branch a given day took.
 
 The one edge case that took real thought: what happens the very first time this DAG runs, when there's no "yesterday" row to compare against? Flagging Day 1 as anomalous by default would mean Day 2 also has no valid baseline (since nothing loaded on Day 1) — a permanent lockout where a human has to manually intervene every single day forever. Cold start is treated as normal instead, on the reasoning that you can't meaningfully call something "a 40% jump" with nothing to jump from.
 
-**Notifications:** flagging an anomaly used to just sit quietly in a table until someone thought to check it. Now `flag_anomalous_rates` fires a notification the moment it finishes writing to `flagged_exchange_rates` — currency, old rate, new rate, percentage change, right there in the alert instead of making someone go query for it. I'm not wiring real SMTP for this project, so it's a clearly-labeled `[EMAIL WOULD SEND]` log for now; the point was getting the trigger placement and payload right, not standing up a mail server.
+**Notifications (Project 7):** flagging an anomaly used to just sit quietly in a table until someone thought to check it. Now `flag_anomalous_rates` fires a notification the moment it finishes writing to `flagged_exchange_rates` — currency, old rate, new rate, percentage change, right there in the alert instead of making someone go query for it. I'm not wiring real SMTP for this project, so it's a clearly-labeled `[EMAIL WOULD SEND]` log for now; the point was getting the trigger placement and payload right, not standing up a mail server.
 
 This is a genuinely different kind of alert from a task failure, and it needed a different mechanism. An anomaly isn't Airflow failing at anything — it's the branch working exactly as designed. So it's a direct log call inside `flag_anomalous_rates` itself, not something routed through `on_failure_callback`.
 
@@ -59,7 +59,9 @@ A `FileSensor` polls every 5 minutes in `mode="reschedule"`, which frees the wor
 
 One thing worth knowing if you're reading the timeout logic: it's duration-based (7 hours from actual task start), not a fixed wall-clock deadline. A delayed scheduler start could theoretically push the cutoff a bit later. I decided that's an acceptable tradeoff for now — false-alarming while the file is still legitimately expected felt like the worse failure mode to build around.
 
-Once `process_settlement_file` finishes successfully, a `TriggerDagRunOperator` kicks off `reconciliation_dag` (a minimal placeholder for now — it just logs that it started, since the point of this project was the triggering mechanism, not new reconciliation logic). It sits after `process_settlement_file` specifically so a sensor timeout or a missing file stops the chain before reconciliation ever fires — Airflow's default `all_success` trigger rule means nothing downstream runs unless everything upstream actually succeeded.
+Once `process_settlement_file` finishes, a `TriggerDagRunOperator` kicks off `reconciliation_dag`. It sits after `process_settlement_file` in the task list, but its `trigger_rule` is set to `ALL_DONE` rather than the default `all_success` — meaning it fires whether the settlement processing succeeded *or* failed. I got this wrong the first time: I originally left it on `all_success`, which meant a missing settlement file would silently prevent reconciliation from running at all that day, with no signal to finance until some later day's successful run happened to backfill the gap. `ALL_DONE` plus `reconciliation_dag` querying `processed_settlement_files` (or finding nothing there) means a Friday failure shows up in that week's report the same afternoon, not whenever the pipeline next happens to succeed.
+
+`TriggerDagRunOperator` also needed `logical_date="{{ logical_date }}"` explicitly — I'd assumed Airflow automatically carries the triggering DAG's logical date over to the triggered one, since that's what my design for the weekly window relied on. It doesn't; left unset, the triggered run's logical date defaults to whenever the trigger physically fires, which would have quietly broken the week calculation on any manual re-run or backfill.
 
 ---
 
@@ -79,13 +81,44 @@ One rule I'm sticking to: `Variable.get()` never gets called at DAG-file top lev
 
 ---
 
+## `reconciliation_dag.py` — the capstone
+
+**The problem:** finance needs a weekly reconciliation report pulling together signups, FX rates (clean and flagged), and settlement completeness. It had been a placeholder that just logged "reconciliation started" since Project 7 — this is where it actually does the job.
+
+**How it aggregates a week:** one consolidated SQL query builds a `generate_series` date backbone for the Monday-Sunday week containing `logical_date`, then `LEFT JOIN`s it against `customer_signups`, `clean_exchange_rates`, `flagged_exchange_rates`, and a new `processed_settlement_files` audit table — which didn't exist before this project either. Without it, there was no durable record of which settlement days actually succeeded, so `bank_settlement_pipeline.py`'s `process_settlement_file` now writes a row there every time it reads a file. That gap only became obvious once I tried to write the reconciliation query and realized there was nothing to query against.
+
+**Status isn't binary.** A week can be `IN_PROGRESS`, `IN_PROGRESS_WITH_GAPS`, `IN_PROGRESS_WITH_ANOMALIES`, `PENDING_AUDIT_GAPS`, `PENDING_FX_REVIEW`, or `FINAL`. The important design call here: gaps and anomalies get surfaced in the status the moment they're detected, mid-week, not held back until Sunday. My first draft had the logic backwards — it checked "is the week over yet" before checking "are there any known problems," which meant a Tuesday settlement gap would just show as `IN_PROGRESS` (indistinguishable from a totally healthy week) until Sunday finally rolled around. Reordering those checks was a small code change but a real shift in what the report actually communicates.
+
+**Two failure paths that needed separate answers.** Working through this project meant tracing actual failure combinations rather than just the happy path:
+
+- *Wednesday: an FX rate gets flagged.* Nothing in `exchange_rates_etl_pipeline` triggers reconciliation directly — only `bank_settlement_sensor_pipeline` does. So the anomaly shows up in the report once Wednesday's settlement run completes and triggers reconciliation afterward, not instantly. A short, acceptable delay.
+- *Friday: the settlement file never arrives.* This one exposed a real gap. With reconciliation purely trigger-driven off settlement *success*, a sensor timeout meant `process_settlement_file` never ran, the trigger never fired, and Friday's gap wouldn't appear in the report until some later day happened to succeed and retroactively notice it. On-call gets paged when the sensor times out — but finance's report stays silently stale in the meantime, which isn't the same thing as finance actually knowing.
+
+**The fix is two triggers doing different jobs, not one.** `reconciliation_dag` now has its own independent `schedule="0 14 * * *"` — a guaranteed daily run that doesn't depend on any other DAG's health at all, even if `bank_settlement_sensor_pipeline` itself got paused or broke entirely. Layered on top, `trigger_reconciliation`'s `trigger_rule` is `ALL_DONE` instead of the default `all_success`, so it also fires immediately when settlement processing finishes — success or failure — giving faster feedback than waiting for the 2pm backstop when things are working normally. The two can both fire within minutes of each other some days; since everything is upserted on `week_start_date`, running the same aggregation twice just recomputes the same result, not a duplicate.
+
+---
+
+## Looking back at the whole arc
+
+Eight projects, four DAGs, one system. A few things that carried through the whole thing rather than being specific to any one project:
+
+**Idempotency was the actual throughline.** Every load in this repo — signups, clean FX rates, flagged FX rates, settlement audit records, weekly reports — is built to be safely re-run. That wasn't a Project 1 lesson I outgrew; it's the same question asked again in each new context: what's the natural key, and what happens if this exact task runs twice?
+
+**Every DAG assumes its neighbors can fail.** Retries only get added where a failure is actually likely to be transient. Missing currencies don't kill a whole day's FX load. A missing settlement file doesn't silently corrupt the reconciliation report — it gets reported as missing, honestly, same day. None of this was designed in one pass; most of it came from being asked "what happens if X fails at this exact point" until an actual gap showed up.
+
+**Config, not just code, needed a boundary.** Deciding what belongs in an Airflow Variable versus what stays hardcoded turned out to be its own real design skill — not "externalize everything" and not "externalize nothing," but a genuine judgment call about who needs to change what, and how often.
+
+**The hardest bugs were never syntax.** The typos got caught fast. The real mistakes were things like assuming `TriggerDagRunOperator` propagates `logical_date` automatically, or a `CASE` statement that technically ran but quietly communicated the wrong thing to finance for days at a time. Those only surface by tracing through specific failure scenarios end-to-end, not by reading code top to bottom.
+
+---
+
 ## Tech stack
 
 Apache Airflow (TaskFlow API), Python (pandas, numpy, requests, psycopg2), PostgreSQL.
 
 ## Status
 
-8-project mentorship series. Done: modular idempotent ETL, retry/logging hardening, a bronze/silver API ingestion pattern, a sensor-based wait pipeline, Airflow Variables + Jinja templating, branching on anomalous rates, and cross-DAG triggering with separate business-alert and operational-failure notification paths. Next: Project 8, the capstone — pulling all of this into one cohesive production-style pipeline.
+8-project mentorship series — complete. Four DAGs working together: modular idempotent ETL, retry/logging hardening, a bronze/silver API ingestion pattern, a sensor-based wait pipeline, Airflow Variables + Jinja templating, branching on anomalous rates, cross-DAG triggering with separate business-alert and operational-failure notification paths, and a capstone weekly reconciliation pipeline with a hybrid fast-path/backstop trigger architecture resilient to upstream DAGs failing outright.
 
 ## Project structure
 
