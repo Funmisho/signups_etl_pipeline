@@ -111,7 +111,7 @@ def bank_settlement_sensor_pipeline():
         logical_date="{{ logical_date }}",
         reset_dag_run=True, # Clears & re-runs existing DAG run if re-triggered for same date
         wait_for_completion=False, # Fire-and-forget; doesn't block worker waiting for completion
-        trigger_rule=TriggerRule.ALL_DONE # Runs whether process_settlement_file succeeded or upstream failed
+        trigger_rule=TriggerRule.ALL_DONE, # Runs whether process_settlement_file succeeded or upstream failed
     )
 
     # Setting dependency, passing TEMPLATED_SETTLEMENT_PATH to the @task function lets Airflow

@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 @dag(
     dag_id="reconciliation_dag",
     start_date=datetime(2026, 8, 1),
-    schedule=None,  # Trigger-driven by bank_settlement_sensor_pipeline
+    schedule="0 14 * * *",  # Daily 2:00 PM guaranteed backstop schedule
     catchup=False,
     default_args={"on_failure_callback": notify_failure},
     tags=["finance", "reconciliation"],

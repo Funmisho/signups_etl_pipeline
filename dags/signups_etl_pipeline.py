@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 from airflow.operators.python import get_current_context
 from airflow.models import Variable
+from psycopg2.extras import execute_values
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +55,7 @@ def signups_etl_pipeline():
         """
         # Fetch path from Airflow Variables
         clean_output_path = Variable.get("SIGNUPS_CLEAN_PATH")
-        rejected_output_path = Variable.get("REJECTED_OUTPUT_PATH")
+        rejected_output_path = Variable.get("SIGNUPS_REJECTED_PATH")
 
         # read the data handed off from extract step
         data = pd.read_csv(filepath, dtype=str)
@@ -70,9 +71,6 @@ def signups_etl_pipeline():
         missing_email_mask = data["email"].isna() | (data["email"] == "")
         is_invalid = missing_id_mask | missing_email_mask
 
-        # separate inital invalid rows
-        rejected_data = data[is_invalid].copy()
-
         # Dynamically assign the rejection reason
         conditions = [
             missing_id_mask & missing_email_mask,
@@ -84,19 +82,24 @@ def signups_etl_pipeline():
             "missing signup_id",
             "missing email",
         ]
-        rejected_data["rejection_reason"] = np.select(
+        data["rejection_reason"] = np.select(
             conditions, reasons, default="Unknown reason"
         )
 
-        # Step 3: Isolate initial clean data
-        clean_data = data[~is_invalid].copy()
+        # separate invalid rows
+        rejected_data = data[is_invalid].copy()
+
+        # Step 3: Isolate clean data
+        clean_data = data[~is_invalid].drop(columns=["rejection_reason"]).copy()
 
         # convert other missing fields to NULL
         clean_data = clean_data.replace("", np.nan)
 
         # Step 4: Log duplicates
         # Find all duplicates in the clean dataset (keep the first one, flag all subsequent)
-        duplicate_mask = clean_data.duplicated(keep="first")
+        duplicate_mask = clean_data.duplicated(
+            subset="signup_id", keep="first"
+        )
 
         if duplicate_mask.any():
             duplicates_df = clean_data[duplicate_mask].copy()
@@ -108,7 +111,7 @@ def signups_etl_pipeline():
             )
 
             # strip the duplicates out of the final clean dataframe
-            clean_data = clean_data[~duplicate_mask]
+            clean_data = clean_data[~duplicate_mask].copy()
   
         # step 5: write out outputs
         clean_data.to_csv(clean_output_path, index=False)
@@ -161,17 +164,33 @@ def signups_etl_pipeline():
                 
         # Initialize the hook
         pg_hook = PostgresHook(postgres_conn_id="my_postgres_conn")
-        engine = pg_hook.get_sqlalchemy_engine()
 
-        # create staging table as an empty clone of production. 
+        # create production table and staging table as an empty clone of production. 
         # so it inherits the exact datatypes perfectly.
-        create_staging_sql = f""" 
+        create_tables_sql = f"""
+            CREATE TABLE IF NOT EXISTS {prod_table} (
+                signup_id VARCHAR(50) PRIMARY KEY,
+                full_name VARCHAR(255),
+                email VARCHAR(255),
+                phone_number VARCHAR(50),
+                signup_date DATE,
+                referral_source VARCHAR(100),
+                plan_type VARCHAR(50)
+            );
+
             CREATE TABLE IF NOT EXISTS {staging_table}
             (LIKE {prod_table} INCLUDING ALL);
 
-            -- Empty the table just incase a retry left data behind
             TRUNCATE TABLE {staging_table};
         """
+
+        staging_insert_sql = f"""
+        INSERT INTO {staging_table} (
+            signup_id, full_name, email, phone_number,
+            signup_date, referral_source, plan_type
+        )
+        VALUES %s;
+    """
 
         # Execute an idempotent upsert from staging to production
         # this SQL handles conflicts gracefully
@@ -190,28 +209,39 @@ def signups_etl_pipeline():
         # clean up by removing temporary staging table
         drop_staging_sql = f"DROP TABLE IF EXISTS {staging_table};"
 
-        # Execute table setup and data merge in a single session
+        # Prepare DataFrame rows as a list of tuples for psycopg2
+        # Replace NaN/empty string with None so Postgres interprets them as real SQL NULLs
+        clean_df = clean_df.replace({np.nan: None, "": None})
+        
+        expected_columns = [
+            "signup_id", "full_name", "email", "phone_number",
+            "signup_date", "referral_source", "plan_type"
+        ]
+        
+        # Ensure any missing optional column exists with None values
+        for col in expected_columns:
+            if col not in clean_df.columns:
+                clean_df[col] = None
+
+        # Slice strictly in order and convert to list of tuples
+        records_to_stage = [
+            tuple(row) for row in clean_df[expected_columns].to_numpy()
+        ]
+
+        # Execute setup, staging bulk insert, merge, and cleanup
         with pg_hook.get_conn() as conn:
             with conn.cursor() as cursor:
                 logger.info("Initializing unique staging table '%s'...", staging_table)
-                cursor.execute(create_staging_sql)
+                cursor.execute(create_tables_sql)
                 conn.commit()
 
         try:
-            # now we write data to the clean, isolated staging table using append
-            logger.info("Staging %d clean rows into '%s'...", len(clean_df), staging_table)
-            clean_df.to_sql(
-                name=staging_table,
-                con=engine,
-                if_exists='append', # uses our pre-made schema
-                index=False,
-                method="multi",
-                chunksize=1000,
-            )
-
-        # perform the final sync
+            # now we write data to the clean, isolated staging table
             with pg_hook.get_conn() as conn:
                 with conn.cursor() as cursor:
+                    logger.info("Staging %d rows into '%s'...", len(records_to_stage), staging_table)
+                    execute_values(cursor, staging_insert_sql, records_to_stage, page_size=1000)
+                    
                     logger.info("Merging staging data into production table '%s'...", prod_table)
                     cursor.execute(merge_sql)
                     conn.commit()
