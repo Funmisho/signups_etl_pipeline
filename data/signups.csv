@@ -1,0 +1,13 @@
+signup_id,full_name,email,phone_number,signup_date,referral_source,plan_type
+1001,Adaeze Okoro,adaeze.okoro@example.com,08012345678,2026-08-17,instagram,premium
+1002,Chidi Umeh,chidi.umeh@example.com,08023456789,2026-08-17,referral,basic
+,Ngozi Eze,ngozi.eze@example.com,08034567890,2026-08-17,facebook,basic
+1004,Tunde Bakare,,08045678901,2026-08-17,google,premium
+,Funke Adeyemi,,08056789012,2026-08-17,twitter,basic
+1006,  Emeka Nwosu  ,  emeka.nwosu@example.com  ,08067890123,2026-08-17,instagram,premium
+1001,Adaeze Okoro,adaeze.okoro@example.com,08012345678,2026-08-17,instagram,premium
+00789,Bisi Lawal,bisi.lawal@example.com,08078901234,2026-08-17,referral,basic
+1008,Kelechi Obi,kelechi.obi@example.com,08089012345,2026-08-17,,premium
+1009,Amaka Chukwu,amaka.chukwu@example.com,08090123456,2026-08-17,google,basic
+00789,Bisi Lawal,bisi.lawal@example.com,08078901234,2026-08-17,referral,basic
+1010,Segun Adewale,segun.adewale@example.com,08001234567,2026-08-17,facebook,premium
