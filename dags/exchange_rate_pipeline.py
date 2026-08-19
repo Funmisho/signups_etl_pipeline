@@ -16,6 +16,52 @@ from utils import notify_failure
 
 logger = logging.getLogger(__name__)
 
+# Centralized DDL Definitions
+CREATE_RAW_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS raw_exchange_rates (
+        id SERIAL PRIMARY KEY,
+        logical_date DATE NOT NULL,
+        fetched_at TIMESTAMP NOT NULL,
+        source_url VARCHAR(255) NOT NULL,
+        raw_response JSONB NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_raw_rates_logical_date
+    ON raw_exchange_rates (logical_date);
+"""
+
+CREATE_CLEAN_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS clean_exchange_rates (
+        id SERIAL PRIMARY KEY,
+        logical_date DATE NOT NULL,
+        currency_code VARCHAR(3) NOT NULL,
+        rate_to_usd NUMERIC(18, 6) NOT NULL,
+        source_raw_id INT NOT NULL REFERENCES raw_exchange_rates(id),
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT unique_date_currency UNIQUE(logical_date, currency_code)   
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_clean_rates_date
+    ON clean_exchange_rates (logical_date);
+"""
+
+CREATE_FLAGGED_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS flagged_exchange_rates (
+        id SERIAL PRIMARY KEY,
+        logical_date DATE NOT NULL,
+        currency_code VARCHAR(3) NOT NULL,
+        rate_to_usd NUMERIC(18, 6) NOT NULL,
+        previous_rate_to_usd NUMERIC(18, 6),
+        percentage_change NUMERIC(8, 4),
+        source_raw_id INT NOT NULL REFERENCES raw_exchange_rates(id),
+        flagged_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT unique_flagged_date_currency UNIQUE(logical_date, currency_code)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_flagged_rates_date
+    ON flagged_exchange_rates (logical_date);
+"""
+
 @dag(
     dag_id="exchange_rates_etl_pipeline",
     start_date=datetime(2026, 7, 26),
@@ -102,19 +148,6 @@ def exchange_rates_etl_pipeline():
         # Preserve Untouched Payload in Postgres Raw Landing Table (Audit Trail)
         pg_hook = PostgresHook(postgres_conn_id="my_postgres_conn")
 
-        create_landing_table_sql = """
-            CREATE TABLE IF NOT EXISTS raw_exchange_rates (
-                id SERIAL PRIMARY KEY,
-                logical_date DATE NOT NULL,
-                fetched_at TIMESTAMP NOT NULL,
-                source_url VARCHAR(255) NOT NULL,
-                raw_response JSONB NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_raw_rates_logical_date
-            ON raw_exchange_rates (logical_date);
-        """
-
         insert_raw_sql = """
             INSERT INTO raw_exchange_rates (logical_date, fetched_at, source_url, raw_response)
             VALUES (%s, %s, %s, %s)
@@ -130,7 +163,7 @@ def exchange_rates_etl_pipeline():
 
         with pg_hook.get_conn() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(create_landing_table_sql)
+                cursor.execute(CREATE_RAW_TABLE_SQL)
                 cursor.execute(insert_raw_sql, values,)
                 inserted_id = cursor.fetchone()[0]
                 conn.commit()
@@ -265,6 +298,7 @@ def exchange_rates_etl_pipeline():
         yesterday_rates = {}
         with pg_hook.get_conn() as conn:
             with conn.cursor() as cursor:
+                cursor.execute(CREATE_CLEAN_TABLE_SQL)
                 cursor.execute(baseline_sql, (yesterday_str,))
                 rows = cursor.fetchall()
                 for currency_code, rate in rows:
@@ -347,23 +381,6 @@ def exchange_rates_etl_pipeline():
 
         pg_hook = PostgresHook(postgres_conn_id="my_postgres_conn")
 
-        # NOTE: DDL included here for local bootstrapping convenience.
-        # In enterprise production, table creation is managed via migration scripts (e.g. Alembic).
-        create_clean_table_sql = """
-            CREATE TABLE IF NOT EXISTS clean_exchange_rates (
-                id SERIAL PRIMARY KEY,
-                logical_date DATE NOT NULL,
-                currency_code VARCHAR(3) NOT NULL,
-                rate_to_usd NUMERIC(18, 6) NOT NULL,
-                source_raw_id INT NOT NULL REFERENCES raw_exchange_rates(id),
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                CONSTRAINT unique_date_currency UNIQUE(logical_date, currency_code)   
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_clean_rates_date
-            ON clean_exchange_rates (logical_date);
-        """
-
         # execute_values dynamically formats (%s, %s, %s, %s) for all rows into a single multi-row INSERT
         upsert_sql = """
             INSERT INTO clean_exchange_rates (
@@ -393,7 +410,7 @@ def exchange_rates_etl_pipeline():
 
         with pg_hook.get_conn() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(create_clean_table_sql)
+                cursor.execute(CREATE_CLEAN_TABLE_SQL)
                 execute_values(cursor, upsert_sql, records_to_insert)
                 conn.commit()
 
@@ -425,23 +442,6 @@ def exchange_rates_etl_pipeline():
 
         pg_hook = PostgresHook(postgres_conn_id="my_postgres_conn")
 
-        create_flagged_table_sql = """
-            CREATE TABLE IF NOT EXISTS flagged_exchange_rates (
-                id SERIAL PRIMARY KEY,
-                logical_date DATE NOT NULL,
-                currency_code VARCHAR(3) NOT NULL,
-                rate_to_usd NUMERIC(18, 6) NOT NULL,
-                previous_rate_to_usd NUMERIC(18, 6),
-                percentage_change NUMERIC(8, 4),
-                source_raw_id INT NOT NULL REFERENCES raw_exchange_rates(id),
-                flagged_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                CONSTRAINT unique_flagged_date_currency UNIQUE(logical_date, currency_code)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_flagged_rates_date
-            ON flagged_exchange_rates (logical_date);
-        """
-
         upsert_flagged_sql = """
             INSERT INTO flagged_exchange_rates (
                 logical_date, currency_code, rate_to_usd, previous_rate_to_usd,
@@ -470,7 +470,7 @@ def exchange_rates_etl_pipeline():
 
         with pg_hook.get_conn() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(create_flagged_table_sql)
+                cursor.execute(CREATE_FLAGGED_TABLE_SQL)
                 execute_values(cursor, upsert_flagged_sql, records_to_insert)
                 conn.commit()
 
