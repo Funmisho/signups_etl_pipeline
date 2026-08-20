@@ -204,9 +204,26 @@ The DAG code does not change at all between local and Azure. Only the Connection
 
 ## Screenshots
 
-_Add screenshots to `docs/screenshots/` and reference them here once captured:_
+### Exchange rate anomaly branch
 
-- Grid view of `exchange_rates_etl_pipeline` on a day the anomaly branch fired, showing `flag_anomalous_rates` succeeded and `load_clean_exchange_rates` skipped.
-- Grid view of the same DAG on a normal day, showing the opposite.
-- A row from `weekly_reconciliation_reports`, formatted, showing a real status other than `FINAL`.
-- Task logs showing a `notify_failure` alert firing after a deliberately induced sensor timeout.
+![Exchange rate anomaly branch](docs/screenshots/exchange-rates-anomaly.png)
+
+Shows `check_for_anomalies` routing the run to `flag_anomalous_rates` while `load_clean_exchange_rates` is skipped.
+
+### Normal exchange rate run
+
+![Normal exchange rate run](docs/screenshots/exchange-rates-normal.png)
+
+Shows the normal branch where the exchange rates pass validation and are loaded into `clean_exchange_rates`.
+
+### Signups ETL pipeline
+
+![Signups ETL pipeline](docs/screenshots/signups-etl.png)
+
+Successful end-to-end run of `signups_etl_pipeline`, with extraction, cleaning, and loading tasks completing successfully.
+
+### Settlement file sensor
+
+![Settlement file sensor](docs/screenshots/settlement-sensor.png)
+
+Shows the `FileSensor` polling for the settlement file, waiting through the first two checks, then detecting the file on the third check and allowing the pipeline to continue.
