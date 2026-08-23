@@ -4,8 +4,6 @@ Four Apache Airflow DAGs built, using a fictional Nigerian fintech, PayNaija, as
 
 Full business requirements for all eight projects that built this system: [`docs/business-requirements.pdf`](docs/business-requirements.pdf). Full design reasoning and debugging notes: [`docs/design-decisions.md`](docs/design-decisions.md).
 
-![Architecture overview](docs/architecture-diagram.png)
-
 ## Table of contents
 
 - [What this is](#what-this-is)
@@ -25,36 +23,7 @@ The point of this project was not to practice Airflow syntax. It was to think th
 
 ## Architecture
 
-```mermaid
-flowchart TB
-    subgraph SIGNUPS["signups_etl_pipeline (daily)"]
-        direction LR
-        S1[extract] --> S2[clean_and_split_data] --> S3[load_data]
-    end
-
-    subgraph FX["exchange_rates_etl_pipeline (daily)"]
-        direction LR
-        F1[extract_raw_exchange_rates] --> F2[transform_exchange_rates] --> F3[check_for_anomalies] --> F4{route_decision}
-        F4 -->|normal| F5[load_clean_exchange_rates]
-        F4 -->|anomaly| F6[flag_anomalous_rates]
-    end
-
-    subgraph SETTLE["bank_settlement_sensor_pipeline (daily, 6am)"]
-        direction LR
-        B1[wait_for_settlement_file] --> B2[process_settlement_file] --> B3[trigger_reconciliation]
-    end
-
-    subgraph RECON["reconciliation_dag (triggered, plus daily 2pm backstop)"]
-        R1[build_weekly_reconciliation]
-    end
-
-    S3 --> PG[(Azure PostgreSQL Flexible Server)]
-    F5 --> PG
-    F6 --> PG
-    B3 --> PG
-    B3 -. triggers, logical_date propagated, ALL_DONE .-> R1
-    R1 --> PG
-```
+![Architecture overview](docs/architecture-diagram.png)
 
 `signups_etl_pipeline` and `exchange_rates_etl_pipeline` run independently on their own daily schedules. `bank_settlement_sensor_pipeline` waits for a file, then triggers `reconciliation_dag` directly. `reconciliation_dag` also has its own independent daily schedule as a backstop, so it never depends entirely on another DAG's health to run. The full reasoning behind that dual-trigger design is in [`docs/design-decisions.md`](docs/design-decisions.md).
 
